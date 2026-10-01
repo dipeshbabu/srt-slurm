@@ -1,0 +1,149 @@
+name: Validate updated sweep and topology PRs
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v4
+      with:
+        fetch-depth: 0
+        ref: ${{ matrix.commit }}
+        persist-credentials: false
+    - name: Install uv
+      uses: astral-sh/setup-uv@v4
+      with:
+        version: latest
+    - name: Set up Python
+      run: uv python install 3.10
+    - name: Install dependencies
+      run: uv sync --dev
+    - name: Run ruff check
+      run: uv run ruff check src/srtctl/
+    - name: Run ruff format check
+      run: uv run ruff format --check src/srtctl/
+    - name: Check docs/schema-reference.md is regenerated
+      run: uv run srtctl schema-docs --check
+    name: lint (PR ${{ matrix.pr }})
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        include: &id001
+        - pr: 293
+          commit: 594f6aadea0a9a88ad6097566234efee75a1e66a
+        - pr: 375
+          commit: 8e804f0cb400fffe8f9ed9595cb0e8568f8c6974
+  typecheck:
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v4
+      with:
+        fetch-depth: 0
+        ref: ${{ matrix.commit }}
+        persist-credentials: false
+    - name: Install uv
+      uses: astral-sh/setup-uv@v4
+      with:
+        version: latest
+    - name: Set up Python
+      run: uv python install 3.10
+    - name: Install dependencies
+      run: uv sync --dev
+    - name: Run ty
+      run: uv run ty check src/srtctl/
+    name: typecheck (PR ${{ matrix.pr }})
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        include: *id001
+  test:
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v4
+      with:
+        fetch-depth: 0
+        ref: ${{ matrix.commit }}
+        persist-credentials: false
+    - name: Install uv
+      uses: astral-sh/setup-uv@v4
+      with:
+        version: latest
+    - name: Set up Python
+      run: uv python install 3.10
+    - name: Install dependencies
+      run: uv sync --dev
+    - name: Run tests
+      run: uv run pytest tests/ -v --tb=short
+    - name: Run tests with coverage
+      run: uv run pytest tests/ --cov=srtctl --cov-report=xml --cov-report=term-missing
+    - name: Upload coverage
+      uses: codecov/codecov-action@v4
+      with:
+        files: coverage.xml
+        fail_ci_if_error: false
+      continue-on-error: true
+    name: test (PR ${{ matrix.pr }})
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        include: *id001
+  mock-and-server:
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v4
+      with:
+        fetch-depth: 0
+        ref: ${{ matrix.commit }}
+        persist-credentials: false
+    - name: Install uv
+      uses: astral-sh/setup-uv@v4
+      with:
+        version: latest
+    - name: Set up Python
+      run: uv python install 3.10
+    - name: Install dependencies
+      run: uv sync --dev
+    - name: Run mock + status-server tests
+      run: "uv run pytest -v \\\n  tests/test_apply_json.py \\\n  tests/test_apply_mock.py \\\n  tests/test_mock_sweep.py \\\n  tests/test_integration_status.py\n"
+    - name: "Smoke \u2014 srtctl apply --mock --json as a real CLI"
+      run: "set -euo pipefail\ncat > /tmp/smoke.yaml <<'EOF'\nschema: 2\nname: ci-smoke\nmodel:\n  path: hf:fake/mock-model\n  container: nvcr.io/fake:latest\n  precision: fp8\nresources:\n  gpu_type: h100\n  gpus_per_node: 8\nengine: sglang\nroles:\n  agg:\n    nodes: 1\n    workers: 1\nbenchmark:\n  type: custom\n  command: echo ci-smoke\nEOF\n\nmkdir -p /tmp/ci-outputs\nuv run srtctl apply \\\n  -f /tmp/smoke.yaml \\\n  -o /tmp/ci-outputs \\\n  --mock \\\n  --mock-tick-s 0.1 \\\n  --json \\\n  > /tmp/submission.json\n\ncat /tmp/submission.json\n\nuv run python - <<'PY'\nimport json, pathlib, time\nsub = json.loads(pathlib.Path(\"/tmp/submission.json\").read_text().strip())\nassert sub[\"status\"] == \"submitted\", sub\noutput_dir = pathlib.Path(sub[\"output_dir\"])\nresult_path = output_dir / \"result.json\"\n# The detached mock worker keeps ticking in the background after\n# apply returns. Give it a generous window to land result.json.\ndeadline = time.monotonic() + 45\nwhile time.monotonic()\
+        \ < deadline:\n    if result_path.exists():\n        break\n    time.sleep(0.25)\nassert result_path.exists(), (\n    f\"mock worker did not finish within window. output_dir contents: \"\n    f\"{sorted(p.name for p in output_dir.iterdir()) if output_dir.exists() else 'MISSING'}\"\n)\nresult = json.loads(result_path.read_text())\nassert result[\"status\"] == \"completed\", result\nassert result[\"exit_code\"] == 0, result\nassert (output_dir / \"status.json\").exists()\nassert (output_dir / \"status_events.jsonl\").exists()\nassert (output_dir / \"recipe.lock.yaml\").exists()\nprint(\"CLI smoke passed:\", {k: result.get(k) for k in (\"job_id\", \"status\", \"score\")})\nPY\n"
+    - name: "Smoke \u2014 python -m srtctl.cli.mock_worker standalone"
+      run: "set -euo pipefail\nmkdir -p /tmp/worker-out/54321\nuv run python -m srtctl.cli.mock_worker \\\n  --config /tmp/smoke.yaml \\\n  --output-dir /tmp/worker-out/54321 \\\n  --job-id 54321 \\\n  --tick-s 0.1\n\ntest -f /tmp/worker-out/54321/result.json\nuv run python -c \"\nimport json\nr = json.loads(open('/tmp/worker-out/54321/result.json').read())\nassert r['status'] == 'completed' and r['exit_code'] == 0, r\nprint('worker standalone:', r)\n\"\n"
+    name: mock-and-server (PR ${{ matrix.pr }})
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        include: *id001
+  validate-examples:
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v4
+      with:
+        fetch-depth: 0
+        ref: ${{ matrix.commit }}
+        persist-credentials: false
+    - name: Install uv
+      uses: astral-sh/setup-uv@v4
+      with:
+        version: latest
+    - name: Set up Python
+      run: uv python install 3.10
+    - name: Install dependencies
+      run: uv sync --dev
+    - name: Validate every example (sweep and override files are expanded)
+      run: "uv run python -c \"\nfrom pathlib import Path\nfrom srtctl.core.config import validate_config_file\n\nexamples = sorted(Path('examples').rglob('*.yaml'))\nprint(f'Found {len(examples)} examples')\nif not examples:\n    print('No examples found')\n    exit(1)\n\nall_errors = []\nfor example in examples:\n    errors = validate_config_file(example)\n    if errors:\n        for e in errors:\n            print(f'\u2717 {e}')\n        all_errors.extend(errors)\n    else:\n        print(f'\u2713 {example.name}')\n\nif all_errors:\n    print(f'\\n{len(all_errors)} validation error(s)')\n    exit(1)\nprint(f'\\nAll {len(examples)} examples valid')\n\"\n"
+    name: validate-examples (PR ${{ matrix.pr }})
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        include: *id001
+'on':
+  push:
+    branches:
+    - ci/review-updates-20261001
+permissions:
+  contents: read
