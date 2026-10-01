@@ -29,9 +29,9 @@ jobs:
       matrix:
         include: &id001
         - pr: 293
-          commit: 3bdffbddd382ff9b9c56292f698b5cc1c7b7cf7f
+          commit: abb41b0af2e2c7319e681285128779ee7400c441
         - pr: 375
-          commit: 512252a97cb3e0cf3b9135ff41d82d7013d225ca
+          commit: 900a1cdb2a7689123eaaf219ee9615d731cfc12d
   typecheck:
     runs-on: ubuntu-latest
     steps:
